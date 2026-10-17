@@ -1,0 +1,96 @@
+name: Build Afo-Q 4
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write        # lets the release job attach files to a GitHub Release
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, name: Windows }
+          - { os: macos-latest,   name: macOS }
+          - { os: ubuntu-latest,  name: Linux }
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libx11-dev libxinerama-dev libxext-dev libxrandr-dev libxcursor-dev \
+            libxcomposite-dev libfreetype-dev libfontconfig1-dev libgl1-mesa-dev libjack-jackd2-dev
+
+      - name: Configure
+        shell: bash
+        run: |
+          ARGS=(-B build -DCMAKE_BUILD_TYPE=Release)
+          if [ "$RUNNER_OS" = "macOS" ]; then ARGS+=("-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"); fi
+          cmake "${ARGS[@]}"
+
+      - name: Build plugin (VST3 + Standalone)
+        run: cmake --build build --config Release --target AfoQ4_VST3 AfoQ4_Standalone --parallel
+
+      - name: Build Audio Unit (macOS)
+        if: runner.os == 'macOS'
+        run: cmake --build build --config Release --target AfoQ4_AU --parallel
+
+      - name: DSP tests
+        shell: bash
+        run: |
+          cmake --build build --config Release --target filter_test --parallel
+          for f in build/filter_test build/Release/filter_test.exe; do if [ -f "$f" ]; then "$f"; fi; done
+
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir -p dist
+          find build -type d \( -name '*.vst3' -o -name '*.component' -o -name '*.app' \) -prune -exec cp -R {} dist/ \;
+          find build -type f -name 'Afo-Q 4.exe' -exec cp {} dist/ \;
+          if [ "$RUNNER_OS" = "Linux" ]; then find build -type f -name 'Afo-Q 4' -perm -u+x -exec cp {} dist/ \;; fi
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AfoQ4-${{ matrix.name }}
+          path: dist
+
+      # ---- on a version tag (v1.0.0 ...): make one zip per platform for the Release ----
+      - name: Zip for release (macOS)
+        if: startsWith(github.ref, 'refs/tags/v') && runner.os == 'macOS'
+        run: ditto -c -k --keepParent dist AfoQ4-${{ matrix.name }}.zip
+      - name: Zip for release (Linux)
+        if: startsWith(github.ref, 'refs/tags/v') && runner.os == 'Linux'
+        run: cd dist && zip -qr ../AfoQ4-${{ matrix.name }}.zip .
+      - name: Zip for release (Windows)
+        if: startsWith(github.ref, 'refs/tags/v') && runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist/* -DestinationPath AfoQ4-${{ matrix.name }}.zip
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: release-${{ matrix.name }}
+          path: AfoQ4-${{ matrix.name }}.zip
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: AfoQ4-*.zip
+          generate_release_notes: true
